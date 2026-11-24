@@ -3,7 +3,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.db import 夹具目录, 连接
-from app.services import 装载, 贯验, 目录
+from app.services import 装载, 贯验, 目录, 回正
+from app.services.回正 import 回正拒绝
 
 路由 = APIRouter(prefix="/api")
 
@@ -94,13 +95,40 @@ def 列行程():
 
 
 @路由.get("/旁路匣")
-def 列旁路():
+def 列旁路(状态: str = ""):
     conn = 连接()
     try:
-        return [dict(r) for r in conn.execute("SELECT * FROM 旁路匣 ORDER BY 编号 DESC LIMIT 100")]
+        if 状态:
+            rows = conn.execute(
+                "SELECT * FROM 旁路匣 WHERE 状态=? ORDER BY 编号 DESC LIMIT 100", (状态,)
+            )
+        else:
+            rows = conn.execute("SELECT * FROM 旁路匣 ORDER BY 编号 DESC LIMIT 100")
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
+
+# 注意：动态路径参数名必须用 ASCII（bid）。FastAPI/Starlette 路径模板对中文参数名
+# 的百分号解码链路不匹配，会返回 404/405；中文仅用于静态路径段与函数内部变量。
+@路由.get("/replay/preview/{bid}")
+def 回正预览(bid: int):
+    """回正只读接口：旁路编号、是否允许回正、重放结果、审计编号、valid。"""
+    return 回正.只读预览(bid)
+
+
+@路由.post("/replay/{bid}")
+def 回正写闸入口(bid: int):
+    """显式回正写闸：校验通过后关旁路、重放成对/开腿并留审计；重复回正幂等。"""
+    try:
+        return 回正.回正写闸(bid)
+    except 回正拒绝 as e:
+        raise HTTPException(status_code=e.状态码, detail=e.原因)
+
+
+@路由.get("/replay")
+def 列回正():
+    return 回正.列审计()
 
 @路由.get("/批次")
 def 列批次():

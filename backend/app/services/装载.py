@@ -4,6 +4,101 @@ from app.seed import 此刻
 from app.services import 时间, 配对
 
 
+def 开腿处理(conn, 卡号: str, 站点键: str, 事件编号: str, 事件时: str, 处理时: str,
+             报告: dict | None = None) -> str:
+    """进站事件的开腿物化：同卡已有在途开腿则旧腿旁路(重复进站)，再开新腿。
+
+    装载与回正重放共用此路径，保证开腿/旁路口径唯一。
+    返回新开腿键。
+    """
+    旧 = conn.execute(
+        "SELECT * FROM 开腿账 WHERE 卡号=? AND 状态='在途'", (卡号,)
+    ).fetchone()
+    if 旧:
+        conn.execute(
+            "UPDATE 开腿账 SET 状态='已旁路', 更新处理时=? WHERE 开腿键=?",
+            (处理时, 旧["开腿键"]),
+        )
+        conn.execute(
+            "UPDATE 刷卡点 SET 命运=? WHERE 事件编号=?",
+            ("已旁路", 旧["进站事件编号"]),
+        )
+        conn.execute(
+            "INSERT INTO 旁路匣(原因, 卡号, 事件编号, 载荷, 时刻) VALUES (?,?,?,?,?)",
+            (
+                "重复进站",
+                卡号,
+                旧["进站事件编号"],
+                json.dumps(
+                    {"旧开腿": 旧["开腿键"], "新进站": 事件编号},
+                    ensure_ascii=False,
+                ),
+                处理时,
+            ),
+        )
+        if 报告 is not None:
+            报告["旁路"] += 1
+            报告["明细"].append(
+                {"事件编号": 旧["进站事件编号"], "命运": "旁路-重复进站"}
+            )
+
+    开腿键 = f"腿-{事件编号}"
+    conn.execute(
+        """INSERT INTO 开腿账(开腿键,卡号,进站事件编号,进站站点键,进站事件时,状态,更新处理时)
+           VALUES (?,?,?,?,?,'在途',?)""",
+        (开腿键, 卡号, 事件编号, 站点键, 事件时, 处理时),
+    )
+    conn.execute(
+        "UPDATE 刷卡点 SET 命运=? WHERE 事件编号=?",
+        ("已开腿", 事件编号),
+    )
+    return 开腿键
+
+
+def 出站处理(conn, 卡号: str, 站点键: str, 事件编号: str, 事件时: str, 处理时: str,
+             报告: dict | None = None) -> dict:
+    """出站事件：同卡先进后出成对；无在途开腿则出站孤儿旁路。
+
+    装载与回正重放共用此路径。返回 {"命运": ..., "行程键"?: ...}。
+    """
+    开腿 = conn.execute(
+        "SELECT * FROM 开腿账 WHERE 卡号=? AND 状态='在途' ORDER BY 进站事件时 ASC LIMIT 1",
+        (卡号,),
+    ).fetchone()
+    if not 开腿:
+        conn.execute(
+            "UPDATE 刷卡点 SET 命运=? WHERE 事件编号=?",
+            ("已旁路", 事件编号),
+        )
+        ev行 = conn.execute(
+            "SELECT * FROM 刷卡点 WHERE 事件编号=?", (事件编号,)
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO 旁路匣(原因, 卡号, 事件编号, 载荷, 时刻) VALUES (?,?,?,?,?)",
+            (
+                "出站孤儿",
+                卡号,
+                事件编号,
+                json.dumps(dict(ev行) if ev行 else {"事件编号": 事件编号}, ensure_ascii=False),
+                处理时,
+            ),
+        )
+        if 报告 is not None:
+            报告["旁路"] += 1
+            报告["明细"].append({"事件编号": 事件编号, "命运": "旁路-出站孤儿"})
+        return {"命运": "已旁路"}
+
+    行程键 = 配对.成对写出站(
+        conn, 开腿, 事件编号, 站点键, 事件时, 处理时
+    )
+    if 报告 is not None:
+        报告["成对"] += 1
+        报告["明细"].append(
+            {"事件编号": 事件编号, "命运": "已成对", "行程键": 行程键}
+        )
+    return {"命运": "已成对", "行程键": 行程键}
+
+
 def 装一批(体: dict) -> dict:
     """装载刷卡点：同卡进站开腿、出站成对；缺腿超时/孤儿旁路。
 
@@ -11,6 +106,7 @@ def 装一批(体: dict) -> dict:
     - 进站：同卡若已有在途开腿 → 旧腿旁路(重复进站)并开新腿
     - 出站：匹配同卡在途开腿 → 写行程账；无开腿 → 出站孤儿旁路
     - 批次末：按本批最大事件时扫缺腿超时
+    并发：BEGIN IMMEDIATE 与回正写闸串行化，杜绝半截开腿/半截行程。
     """
     批次编号 = 体.get("批次编号") or f"批-{此刻().replace(':', '').replace('-', '')}"
     事件列表 = 体.get("事件") or []
@@ -28,6 +124,7 @@ def 装一批(体: dict) -> dict:
         站 = {r["键"]: r["值"] for r in conn.execute("SELECT 键, 值 FROM 站规")}
         最大行程秒 = int(站.get("最大行程秒", "7200"))
         水位 = None
+        conn.execute("BEGIN IMMEDIATE")
 
         for ev in 事件列表:
             事件编号 = ev["事件编号"]
@@ -83,79 +180,11 @@ def 装一批(体: dict) -> dict:
             报告["入流"] += 1
 
             if 方向 == "进站":
-                旧 = conn.execute(
-                    "SELECT * FROM 开腿账 WHERE 卡号=? AND 状态='在途'", (卡号,)
-                ).fetchone()
-                if 旧:
-                    conn.execute(
-                        "UPDATE 开腿账 SET 状态='已旁路', 更新处理时=? WHERE 开腿键=?",
-                        (处理时, 旧["开腿键"]),
-                    )
-                    conn.execute(
-                        "UPDATE 刷卡点 SET 命运=? WHERE 事件编号=?",
-                        ("已旁路", 旧["进站事件编号"]),
-                    )
-                    conn.execute(
-                        "INSERT INTO 旁路匣(原因, 卡号, 事件编号, 载荷, 时刻) VALUES (?,?,?,?,?)",
-                        (
-                            "重复进站",
-                            卡号,
-                            旧["进站事件编号"],
-                            json.dumps(
-                                {"旧开腿": 旧["开腿键"], "新进站": 事件编号},
-                                ensure_ascii=False,
-                            ),
-                            处理时,
-                        ),
-                    )
-                    报告["旁路"] += 1
-                    报告["明细"].append(
-                        {"事件编号": 旧["进站事件编号"], "命运": "旁路-重复进站"}
-                    )
-
-                开腿键 = f"腿-{事件编号}"
-                conn.execute(
-                    """INSERT INTO 开腿账(开腿键,卡号,进站事件编号,进站站点键,进站事件时,状态,更新处理时)
-                       VALUES (?,?,?,?,?,'在途',?)""",
-                    (开腿键, 卡号, 事件编号, 站点键, 事件时, 处理时),
-                )
-                conn.execute(
-                    "UPDATE 刷卡点 SET 命运=? WHERE 事件编号=?",
-                    ("已开腿", 事件编号),
-                )
+                开腿键 = 开腿处理(conn, 卡号, 站点键, 事件编号, 事件时, 处理时, 报告)
                 报告["开腿"] += 1
                 报告["明细"].append({"事件编号": 事件编号, "命运": "已开腿", "开腿键": 开腿键})
             else:
-                开腿 = conn.execute(
-                    "SELECT * FROM 开腿账 WHERE 卡号=? AND 状态='在途' ORDER BY 进站事件时 ASC LIMIT 1",
-                    (卡号,),
-                ).fetchone()
-                if not 开腿:
-                    conn.execute(
-                        "UPDATE 刷卡点 SET 命运=? WHERE 事件编号=?",
-                        ("已旁路", 事件编号),
-                    )
-                    conn.execute(
-                        "INSERT INTO 旁路匣(原因, 卡号, 事件编号, 载荷, 时刻) VALUES (?,?,?,?,?)",
-                        (
-                            "出站孤儿",
-                            卡号,
-                            事件编号,
-                            json.dumps(ev, ensure_ascii=False),
-                            处理时,
-                        ),
-                    )
-                    报告["旁路"] += 1
-                    报告["明细"].append({"事件编号": 事件编号, "命运": "旁路-出站孤儿"})
-                    continue
-
-                行程键 = 配对.成对写出站(
-                    conn, 开腿, 事件编号, 站点键, 事件时, 处理时
-                )
-                报告["成对"] += 1
-                报告["明细"].append(
-                    {"事件编号": 事件编号, "命运": "已成对", "行程键": 行程键}
-                )
+                出站处理(conn, 卡号, 站点键, 事件编号, 事件时, 处理时, 报告)
 
         if 水位:
             报告["超时旁路"] = 配对.扫缺腿超时(conn, 最大行程秒, 水位, 此刻())
@@ -167,5 +196,8 @@ def 装一批(体: dict) -> dict:
         )
         conn.commit()
         return 报告
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()

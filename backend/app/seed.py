@@ -62,7 +62,9 @@ CREATE TABLE IF NOT EXISTS 旁路匣 (
   卡号 TEXT NOT NULL DEFAULT '',
   事件编号 TEXT NOT NULL DEFAULT '',
   载荷 TEXT NOT NULL,
-  时刻 TEXT NOT NULL
+  时刻 TEXT NOT NULL,
+  状态 TEXT NOT NULL DEFAULT '待回正',
+  回正审计编号 INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS 行程贯验 (
   编号 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +76,44 @@ CREATE TABLE IF NOT EXISTS 行程贯验 (
   是否通过 INTEGER NOT NULL,
   说明 TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS 回正审计 (
+  审计编号 INTEGER PRIMARY KEY AUTOINCREMENT,
+  旁路编号 INTEGER NOT NULL UNIQUE,
+  卡号 TEXT NOT NULL DEFAULT '',
+  事件编号 TEXT NOT NULL DEFAULT '',
+  结果 TEXT NOT NULL,
+  行程键 TEXT NOT NULL DEFAULT '',
+  开腿键 TEXT NOT NULL DEFAULT '',
+  时刻 TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_回正审计_事件 ON 回正审计(事件编号);
 """
+
+
+def _迁移(conn) -> None:
+    """老库补列/补表：旁路匣回正状态与审计外键。"""
+    列 = {r["name"] for r in conn.execute("PRAGMA table_info(旁路匣)")}
+    if "状态" not in 列:
+        conn.execute("ALTER TABLE 旁路匣 ADD COLUMN 状态 TEXT NOT NULL DEFAULT '待回正'")
+    if "回正审计编号" not in 列:
+        conn.execute(
+            "ALTER TABLE 旁路匣 ADD COLUMN 回正审计编号 INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS 回正审计 (
+          审计编号 INTEGER PRIMARY KEY AUTOINCREMENT,
+          旁路编号 INTEGER NOT NULL UNIQUE,
+          卡号 TEXT NOT NULL DEFAULT '',
+          事件编号 TEXT NOT NULL DEFAULT '',
+          结果 TEXT NOT NULL,
+          行程键 TEXT NOT NULL DEFAULT '',
+          开腿键 TEXT NOT NULL DEFAULT '',
+          时刻 TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_回正审计_事件 ON 回正审计(事件编号)"
+    )
 
 
 def 此刻() -> str:
@@ -84,6 +123,7 @@ def 此刻() -> str:
 def 初始化库() -> None:
     conn = 连接()
     conn.executescript(建表)
+    _迁移(conn)
     if conn.execute("SELECT COUNT(*) AS c FROM 站规").fetchone()["c"] == 0:
         for k, v in {
             "站名": "闸对",
